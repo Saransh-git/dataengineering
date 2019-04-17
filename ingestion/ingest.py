@@ -6,14 +6,18 @@ import numpy as np
 from pandas import DataFrame
 from sqlalchemy import create_engine, MetaData, Table, UniqueConstraint, Column, Integer, Unicode, String, event
 from sqlalchemy.sql.dml import Insert
-from sqlalchemy.engine import reflection
+from sqlalchemy.engine import reflection, Connection
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from typing import List, Optional, Union, Dict, Tuple
+from typing import List, Optional, Union, Dict, Tuple, Any
+
+from sqlalchemy.sql.type_api import TypeEngine
 from sqlalchemy.types import BigInteger, ARRAY
 from sqlalchemy import cast, type_coerce
 from ingestion.exceptions import ConnectionNotConfigured, SchemaMisMatch
 
+
+from sqlalchemy.engine.reflection import Inspector
 
 class DBConnectionFactory:
     """
@@ -66,7 +70,7 @@ class DataToRelations:
             auto_add_ts: bool = False, auto_add_ts_col: str = None, batch_size: int = None,
             fields: Union[List, Dict[str, str]] = None, unique_fields: List[Tuple[str, ...]] = None,
             keep_unique: Union[str, List[str]] = 'last',
-            non_nullable_fields: List[str] = None, **kwargs
+            non_nullable_fields: List[str] = None, default_vals: Dict[str, Any] = {}, **kwargs
     ) -> None:
         """
         :param table_name: Name of the table to ingest data to
@@ -93,23 +97,19 @@ class DataToRelations:
 
         self.engine = create_engine(conn_url, echo=True)
 
-        self.table = Table(
-            'testtable', MetaData(schema=schema),
-            Column('name', String(50), nullable=False), autoload=True, autoload_with=self.engine
-        )
+        self.table: Table = Table(table_name, MetaData(schema=schema), autoload=True, autoload_with=self.engine,
+                           extend_existing=True)
+
         self.strict = strict
         self.unique_fields = unique_fields
         self.non_nullable_fields = non_nullable_fields
-        event.listen(self.engine, "before_execute", partial(self.before_execute, keep_unique=keep_unique),
-                     retval=True, named=True)
-        event.listen(self.engine, "before_execute", self.remove_nas_before_execute, retval=True, named=True)
-        self.conn = self.engine.connect()
+        self.default_vals = default_vals
         mapped_columns = fields if isinstance(fields, List) else (isinstance(fields, Dict) or []) and fields.values()
-        self.match_columns = []
+        self.match_columns = []  # grab the concerned/ interested fields
 
         if mapped_columns:
             for column in mapped_columns:
-                if column not in self.table.c:
+                if column in self.table.c:
                     self.match_columns.append(column)
 
             if self.strict and len(self.match_columns) != len(fields):  # any provided field not in table schema
@@ -120,19 +120,45 @@ class DataToRelations:
         else:
             self.match_columns = [c.name for c in self.table.c]
 
+        if not self.strict:
+            partial_table = partial(
+                Table, self.table.name, self.table.metadata, autoload=True, autoload_with=self.engine,
+                extend_existing=True)
+            for col in default_vals:
+                partial_table = partial(
+                    partial_table, Column(
+                        col, self.table.c[col].type, default=self.set_default
+                    )
+                )  # this would ensure a default value when data for these cols are not provided.
+            self.table = partial_table()
+
+        event.listen(self.engine, "before_execute", partial(self.keep_unique_vals, keep_unique=keep_unique),
+                     retval=True, named=True)
+        event.listen(self.engine, "before_execute", self.remove_nas_before_execute, retval=True, named=True)
+        event.listen(self.engine, "before_cursor_execute", self.keep_strict_cols_only, retval=True)
+        self.conn: Connection = self.engine.connect()
+
     __init__.__doc__ = ":param conn_url: " + \
                        f"RFC 1738 compatible engine string or pass the connection details as " \
                        f"keyworded arguments:\n" \
                        f"{DBConnectionFactory.from_factory.__doc__}\n" \
                        + __init__.__doc__
 
-    def before_execute(self, conn, clauseelement, multiparams, params, **kwargs):
+    def set_default(self, context, **kwargs):
+        col_type = context.current_column.type
+        col_name = context.current_column.name
+        current_val = context.get_current_parameters()[col_name]
+        if not current_val:
+            return col_type.python_type(self.default_vals[col_name])
+        return current_val
+
+    def keep_unique_vals(self, conn, clauseelement, multiparams, params, **kwargs):
         if not isinstance(clauseelement, Insert) or not multiparams or not self.unique_fields:
             return clauseelement, multiparams, params
 
         keep_unique = kwargs['keep_unique']
         if self.unique_fields:
-            df: DataFrame = pd.DataFrame.from_records(multiparams)
+            df: DataFrame = pd.DataFrame.from_records(multiparams[0])
             for idx, subset in enumerate(self.unique_fields):
                 if isinstance(keep_unique, list):
                     df.drop_duplicates(subset, keep_unique[idx], inplace=True)
@@ -142,13 +168,14 @@ class DataToRelations:
         vals = []
         for row in df.itertuples():
             row_val = {}
-            for key in multiparams[row.Index]:
+            for key in multiparams[0][row.Index]:
                 row_val[key] = getattr(row, key)  # Preserving the initial imbalance in case if passed in multiple
                 # parameters, so as to invoke StatementError.
             vals.append(row_val)
         return clauseelement, tuple(vals), params
 
     def remove_nas_before_execute(self, conn, clauseelement, multiparams, params, **kwargs):
+        self.insert_clause = clauseelement
         if not self.non_nullable_fields or not isinstance(clauseelement, Insert) or not multiparams:
             return clauseelement, multiparams, params
 
@@ -163,6 +190,10 @@ class DataToRelations:
                 # parameters, so as to invoke StatementError.
             vals.append(row_val)
         return clauseelement, tuple(vals), params
+
+    def keep_strict_cols_only(self, conn, cursor, statement, parameters, context, executemany):
+        statement = str(self.insert_clause.compile(dialect=self.engine.dialect))
+        return statement, parameters
 
     def ingest_json_or_dict(self, **kwargs):
         """
