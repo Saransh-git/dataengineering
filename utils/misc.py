@@ -20,7 +20,6 @@ class dependencies_func:
         has_self = True if spec.args[0] in ['cls', 'self'] else False
         if has_self:
             raise TypeError("Not supported for methods.")
-        update_wrapper(self.wrapped_func, fn)
         partial_fn = partial(fn)
         for dep in self.deps:
             partial_fn = partial(partial_fn, import_module(dep))
