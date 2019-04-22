@@ -1,5 +1,8 @@
+from ingestion.helpers import BlankParamValue
+
+
 class BaseIngestionException(Exception):
-    note = None  # description of error in detail
+    desc = "Ingestion Error"  # description of error in detail
 
     def __init__(self, msg: str='Ingestion Exception', **kwargs):
         self.msg: str = msg
@@ -9,8 +12,7 @@ class BaseIngestionException(Exception):
             pass
 
     def __str__(self):
-        error_msg = f"{self.msg} - {self.note}" if self.note else {self.msg}
-        return f"{type(self)}: {error_msg}"
+        return f"{self.desc} - {self.msg}"
 
 
 class ConnectionNotConfigured(BaseIngestionException):
@@ -19,7 +21,20 @@ class ConnectionNotConfigured(BaseIngestionException):
 
 
 class SchemaMisMatch(BaseIngestionException):
-    note = "Provided fields don't match with the table schema"
 
-    def __init__(self, msg='Schema mismatch error', **kwargs):
+    def __init__(self, msg="Provided fields don't match with the table schema", **kwargs):
         super().__init__(msg, **kwargs)
+
+
+class StrictIngestionError(BaseIngestionException):
+    desc = "Ingesting strictly"
+
+    def __init__(self, missing_col, param, **kwargs):
+        msg = self._construct_msg(missing_col, param)
+        super().__init__(msg, **kwargs)
+
+    @staticmethod
+    def _construct_msg(missing_col, param):
+        item = {key: val for key, val in param.items() if not isinstance(val, BlankParamValue)}
+        return f"Value missing for {missing_col} at {item}. " \
+               f"Consider removing strict constraint and/or passing a default"

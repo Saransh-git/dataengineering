@@ -1,29 +1,23 @@
 from enum import Enum, unique
 from functools import partial
-
-import pandas as pd
-import numpy as np
-from pandas import DataFrame
-from sqlalchemy import create_engine, MetaData, Table, UniqueConstraint, Column, Integer, Unicode, String, event
-from sqlalchemy.sql.dml import Insert
-from sqlalchemy.engine import reflection, Connection
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 from typing import List, Optional, Union, Dict, Tuple, Any
 
-from sqlalchemy.sql.type_api import TypeEngine
-from sqlalchemy.types import BigInteger, ARRAY
-from sqlalchemy import cast, type_coerce
-from ingestion.exceptions import ConnectionNotConfigured, SchemaMisMatch
+import pandas as pd
+from pandas import DataFrame
+from sqlalchemy import create_engine, MetaData, Table, Column, event
+from sqlalchemy.engine import Connection
+from sqlalchemy.sql.dml import Insert
 
+from ingestion.exceptions import ConnectionNotConfigured, SchemaMisMatch, StrictIngestionError
+from ingestion.helpers import BlankParamValue
 
-from sqlalchemy.engine.reflection import Inspector
 
 class DBConnectionFactory:
     """
     generates an RFC 1738 compatible connection url for relational DBs
     RFC 1738: https://www.ietf.org/rfc/rfc1738.txt
     """
+
     @unique
     class Scheme(Enum):
         POSTGRESQL = 'postgresql'
@@ -98,15 +92,16 @@ class DataToRelations:
         self.engine = create_engine(conn_url, echo=True)
 
         self.table: Table = Table(table_name, MetaData(schema=schema), autoload=True, autoload_with=self.engine,
-                           extend_existing=True)
+                                  extend_existing=True)
 
         self.strict = strict
         self.unique_fields = unique_fields
         self.non_nullable_fields = non_nullable_fields
         self.default_vals = default_vals
-        mapped_columns = fields if isinstance(fields, List) else (isinstance(fields, Dict) or []) and fields.values()
+        self.fields = fields
+        mapped_columns = fields if isinstance(fields, List) else (isinstance(fields, Dict) or []) and fields.keys()
         self.match_columns = []  # grab the concerned/ interested fields
-
+        self.data = [{}]  # to avoid any statement error
         if mapped_columns:
             for column in mapped_columns:
                 if column in self.table.c:
@@ -120,17 +115,17 @@ class DataToRelations:
         else:
             self.match_columns = [c.name for c in self.table.c]
 
-        if not self.strict:
+        partial_table = partial(
+            Table, self.table.name, self.table.metadata, autoload=True, autoload_with=self.engine,
+            extend_existing=True)
+        for col in self.match_columns:
             partial_table = partial(
-                Table, self.table.name, self.table.metadata, autoload=True, autoload_with=self.engine,
-                extend_existing=True)
-            for col in default_vals:
-                partial_table = partial(
-                    partial_table, Column(
-                        col, self.table.c[col].type, default=self.set_default
-                    )
-                )  # this would ensure a default value when data for these cols are not provided.
-            self.table = partial_table()
+                partial_table, Column(
+                    col, self.table.c[col].type, default=self.set_default
+                )
+            )  # this would ensure a default value when data for these cols are not provided.
+
+            self.table: Table = partial_table()
 
         event.listen(self.engine, "before_execute", partial(self.keep_unique_vals, keep_unique=keep_unique),
                      retval=True, named=True)
@@ -145,11 +140,19 @@ class DataToRelations:
                        + __init__.__doc__
 
     def set_default(self, context, **kwargs):
+        """
+        Overrides default only for the set which has not been assigned
+        """
         col_type = context.current_column.type
         col_name = context.current_column.name
         current_val = context.get_current_parameters()[col_name]
-        if not current_val:
-            return col_type.python_type(self.default_vals[col_name])
+        if isinstance(current_val, BlankParamValue):
+            if self.strict:
+                raise StrictIngestionError(col_name, context.get_current_parameters())
+            try:
+                return col_type.python_type(self.default_vals[col_name])
+            except KeyError:
+                return None  # no default assigned
         return current_val
 
     def keep_unique_vals(self, conn, clauseelement, multiparams, params, **kwargs):
@@ -192,18 +195,39 @@ class DataToRelations:
         return clauseelement, tuple(vals), params
 
     def keep_strict_cols_only(self, conn, cursor, statement, parameters, context, executemany):
-        statement = str(self.insert_clause.compile(dialect=self.engine.dialect))
+        if not context.isinsert:
+            return statement, parameters
+
+        statement = str(self.insert_clause.compile(dialect=self.engine.dialect, column_keys=self.match_columns))
+        if executemany:
+            parameters = parameters[1:]
         return statement, parameters
 
-    def ingest_json_or_dict(self, **kwargs):
+    def _append_dict_line(self, data_dict: Dict[str, Any]):
+        item = {}
+        for col in self.match_columns:
+            item[col] = data_dict.get(self.fields[col], BlankParamValue())
+        self.data.append(item)
+
+    def ingest_json_or_dict(self, data: Union[str, List[Dict[str, Any]], Dict[str, Any]], **kwargs):
         """
         Ingests from json
         :return:
         """
-        pd.read_json()
+        if isinstance(data, Dict):
+            self._append_dict_line(data)
+
+        if isinstance(data, str):
+            data = pd.read_json(data, typ=None)
+
+        elif hasattr(data, '__iter__'):
+            for data_dict in data:
+                self._append_dict_line(data_dict)
+
+        self.conn.execute(self.table.insert(), self.data)
 
     def ingest_csv(self):
-        pd.read_csv
+        pass
 
     def ingest_pd_dataframe(self):
         pass
