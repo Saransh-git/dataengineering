@@ -205,14 +205,24 @@ class DataToRelations:
 
     def _append_dict_line(self, data_dict: Dict[str, Any]):
         item = {}
+        missing_params = []
         for col in self.match_columns:
-            item[col] = data_dict.get(self.fields[col], BlankParamValue())
+            try:
+                item[col] = data_dict.get(self.fields[col])
+            except KeyError:
+                if self.strict:
+                    missing_params.append(col)
+                else:
+                    item[col] = BlankParamValue()
+        if self.strict and missing_params:
+            raise StrictIngestionError(missing_params, item)
         self.data.append(item)
 
-    def ingest_json_or_dict(self, data: Union[str, List[Dict[str, Any]], Dict[str, Any]], **kwargs):
+    def ingest_json_or_dict(self, data: Union[str, List[Dict[str, Any]], Dict[str, Any]], encoding=None):
         """
-        Ingests from json
-        :return:
+        Ingests from json or a path/url providing json. If providing a path, optionally provide an encoding which
+        which otherwise defaults to 'utf-8' if not provided.
+        Accepts Dict/ an Iterator providing dict items on a row basis.
         """
         if isinstance(data, Dict):
             self._append_dict_line(data)
@@ -226,10 +236,10 @@ class DataToRelations:
 
         self.conn.execute(self.table.insert(), self.data)
 
-    def ingest_csv(self):
+    def ingest_csv(self, file_path: str, *args, **kwargs):
         pass
 
-    def ingest_pd_dataframe(self):
+    def ingest_pd_dataframe(self, dataframe: DataFrame):
         pass
 
     def ingest_orc(self):
