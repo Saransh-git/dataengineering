@@ -12,7 +12,7 @@ class BaseIngestionException(Exception):
             pass
 
     def __str__(self):
-        return f"{self.desc} - {self.msg}"
+        return f"{self.msg} - {self.desc}"
 
 
 class ConnectionNotConfigured(BaseIngestionException):
@@ -38,3 +38,7 @@ class StrictIngestionError(BaseIngestionException):
         item = {key: val for key, val in param.items() if not isinstance(val, BlankParamValue)}
         return f"Value missing for {missing_col} at {item}. " \
                f"Consider removing strict constraint and/or passing a default"
+
+
+class EmptyDataIngestion(BaseIngestionException):
+    desc = "Empty data ingestion is not allowed."

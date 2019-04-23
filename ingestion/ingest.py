@@ -1,15 +1,19 @@
+import logging
 from enum import Enum, unique
 from functools import partial
 from typing import List, Optional, Union, Dict, Tuple, Any
 
 import pandas as pd
-from pandas import DataFrame
+from pandas import DataFrame, Series
 from sqlalchemy import create_engine, MetaData, Table, Column, event
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.dml import Insert
 
-from ingestion.exceptions import ConnectionNotConfigured, SchemaMisMatch, StrictIngestionError
+from ingestion.exceptions import ConnectionNotConfigured, SchemaMisMatch, StrictIngestionError, EmptyDataIngestion
 from ingestion.helpers import BlankParamValue
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.NOTSET)  # log all kinds of log levels
 
 
 class DBConnectionFactory:
@@ -197,10 +201,12 @@ class DataToRelations:
     def keep_strict_cols_only(self, conn, cursor, statement, parameters, context, executemany):
         if not context.isinsert:
             return statement, parameters
-
+        import ipdb;ipdb.set_trace()
         statement = str(self.insert_clause.compile(dialect=self.engine.dialect, column_keys=self.match_columns))
         if executemany:
             parameters = parameters[1:]
+        else:
+            raise EmptyDataIngestion
         return statement, parameters
 
     def _append_dict_line(self, data_dict: Dict[str, Any]):
@@ -218,6 +224,17 @@ class DataToRelations:
             raise StrictIngestionError(missing_params, item)
         self.data.append(item)
 
+    def _execute(self):
+        if not self.data:
+            return
+        try:
+            self.conn.execute(self.table.insert(), self.data)
+        except EmptyDataIngestion:
+            logger.info("Execute called with empty data")
+            return  # handled silently as empty ingestion is internal to use.
+        self.data.clear()  # keep the data intact if the cursor issues an error, so that source doesn't have to be read
+        # all over again. Also, if this method is invoked again, the same should have no effect.
+
     def ingest_json_or_dict(self, data: Union[str, List[Dict[str, Any]], Dict[str, Any]], encoding=None):
         """
         Ingests from json or a path/url providing json. If providing a path, optionally provide an encoding which
@@ -230,17 +247,23 @@ class DataToRelations:
         if isinstance(data, str):
             data = pd.read_json(data, typ=None)
 
-        elif hasattr(data, '__iter__'):
+        if hasattr(data, '__iter__'):
             for data_dict in data:
                 self._append_dict_line(data_dict)
-
-        self.conn.execute(self.table.insert(), self.data)
+        self._execute()
 
     def ingest_csv(self, file_path: str, *args, **kwargs):
         pass
 
-    def ingest_pd_dataframe(self, dataframe: DataFrame):
-        pass
+    def ingest_pd_dataframe_or_series(self, obj: Union[DataFrame, Series]):
+        if isinstance(obj, Series):
+            for item in obj.to_list():
+                self._append_dict_line({obj.name: item})
+            self._execute()
+        elif isinstance(obj, DataFrame):
+            self.ingest_json_or_dict(obj.to_dict(orient='records'))
+        else:
+            raise TypeError('Invalid type for "obj". Only accepts pandas DataFrame/ Series.')
 
     def ingest_orc(self):
         pass
