@@ -1,3 +1,4 @@
+import csv
 import logging
 from enum import Enum, unique
 from functools import partial
@@ -112,10 +113,10 @@ class DataToRelations:
                     self.match_columns.append(column)
 
             if self.strict and len(self.match_columns) != len(fields):  # any provided field not in table schema
-                raise SchemaMisMatch
+                raise SchemaMisMatch(f"Fields {set(fields) - set(match_columns)} not belong to table schema")
 
             if not len(self.match_columns):
-                raise SchemaMisMatch
+                raise SchemaMisMatch(f"Fields {fields} not belong to table schema")
         else:
             self.match_columns = [c.name for c in self.table.c]
 
@@ -135,6 +136,8 @@ class DataToRelations:
                      retval=True, named=True)
         event.listen(self.engine, "before_execute", self.remove_nas_before_execute, retval=True, named=True)
         event.listen(self.engine, "before_cursor_execute", self.keep_strict_cols_only, retval=True)
+        # retval to specify that a value should be returned from these event listeners. Handy in case this is just done
+        # for logging purposes.
         self.conn: Connection = self.engine.connect()
 
     __init__.__doc__ = ":param conn_url: " + \
@@ -152,7 +155,7 @@ class DataToRelations:
         current_val = context.get_current_parameters()[col_name]
         if isinstance(current_val, BlankParamValue):
             if self.strict:
-                raise StrictIngestionError(col_name, context.get_current_parameters())
+                raise StrictIngestionError(context.get_current_parameters())
             try:
                 return col_type.python_type(self.default_vals[col_name])
             except KeyError:
@@ -214,14 +217,15 @@ class DataToRelations:
         missing_params = []
         for col in self.match_columns:
             try:
-                item[col] = data_dict.get(self.fields[col])
+                data_col: str = self.fields[col] if isinstance(self.fields, Dict) else col
+                item[col] = data_dict[data_col]
             except KeyError:
                 if self.strict:
-                    missing_params.append(col)
+                    missing_params.append(data_col)
                 else:
-                    item[col] = BlankParamValue()
+                    item[col] = BlankParamValue(col)
         if self.strict and missing_params:
-            raise StrictIngestionError(missing_params, item)
+            raise StrictIngestionError(missing_params, data_dict)
         self.data.append(item)
 
     def _execute(self):
@@ -243,16 +247,26 @@ class DataToRelations:
         """
         if isinstance(data, Dict):
             self._append_dict_line(data)
+        else:
+            if isinstance(data, str):  # this str could be a url, file path, or a json string
+                data: DataFrame = pd.read_json(data, typ=None)
+                data = data.to_dict(orient='records')
 
-        if isinstance(data, str):
-            data = pd.read_json(data, typ=None)
+            if hasattr(data, '__iter__'):
+                for data_dict in data:
+                    if not isinstance(data_dict, Dict):
+                        raise ValueError(
+                            f"Only dict items allowed. The iterator incurred an item of type {type(data_dict)}"
+                        )
+                    self._append_dict_line(data_dict)
 
-        if hasattr(data, '__iter__'):
-            for data_dict in data:
-                self._append_dict_line(data_dict)
         self._execute()
 
-    def ingest_csv(self, file_path: str, *args, **kwargs):
+    def ingest_csv(
+            self, file_path: str, delimiter, header, mangle_dupe_cols, skipinitialspace, skiprows, skipfooter, nrows,
+            na_values, skip_blank_lines, compression, quotechar, quoting, doublequote, escapechar, encoding, dialect,
+            chunksize, *args, **kwargs):
+        pd.read_csv
         pass
 
     def ingest_pd_dataframe_or_series(self, obj: Union[DataFrame, Series]):
